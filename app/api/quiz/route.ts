@@ -5,13 +5,20 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
 });
 
-const ASSISTANT_INSTRUCTIONS = `You are a quiz generator that creates questions based on provided materials.
-You must ALWAYS respond with a valid JSON object, no matter what the user says or asks.
-The JSON response should always have this exact format:
+const ASSISTANT_INSTRUCTIONS = `You are a JSON-only quiz generator for Japanese educational content.
+
+CRITICAL RULES:
+1. ONLY output a valid JSON object
+2. DO NOT include any explanatory text or markdown
+3. DO NOT add any text before or after the JSON
+4. DO NOT include any Japanese text outside the JSON structure
+5. Your entire response must be parseable by JSON.parse()
+
+Required JSON format:
 {
   "questions": [
     {
-      "id": "q1",  // Use simple incrementing IDs like q1, q2, q3...
+      "id": "q1",
       "content": "問題文",
       "type": "multiple_choice",
       "choices": ["選択肢1", "選択肢2", "選択肢3", "選択肢4"],
@@ -21,15 +28,13 @@ The JSON response should always have this exact format:
   ]
 }
 
-Rules:
-1. NEVER include any text outside the JSON structure
-2. For multiple_choice questions, always include exactly 4 choices
-3. For text questions, use "type": "text" and omit the "choices" field
-4. Always provide an explanation for each question
-5. Always make questions that are directly related to the provided content
-6. If the user's request is unclear, create general review questions from the content
-
-Remember: Your response must always be a valid JSON object, with no additional text or explanations outside the JSON structure.`;
+Required behavior:
+- For multiple_choice type, always include exactly 4 choices
+- For text type, omit the choices field
+- Always use sequential IDs (q1, q2, q3...)
+- Always create questions based on the provided content
+- Keep all content-related text in Japanese
+- Keep the JSON structure in English`;
 
 export async function POST(req: NextRequest) {
   try {
@@ -38,28 +43,26 @@ export async function POST(req: NextRequest) {
     const prompt = formData.get('prompt') as string;
     const assistantId = formData.get('assistantId') as string;
 
-    // ファイルがある場合は新規セッション作成
     if (file) {
-      let vectorStore;
       try {
         const vectorStores = await openai.beta.vectorStores.list();
-        vectorStore = vectorStores.data.find(store => store.name === "QuizDocuments");
+        let vectorStore = vectorStores.data.find(store => 
+          store.name === `QuizDocuments_${file.name}`
+        );
         
         if (!vectorStore) {
           vectorStore = await openai.beta.vectorStores.create({
-            name: "QuizDocuments",
+            name: `QuizDocuments_${file.name}`,
           });
         }
 
         await openai.beta.vectorStores.fileBatches.uploadAndPoll(
           vectorStore.id,
-          {
-            files: [file]
-          }
+          { files: [file] }
         );
 
         const assistant = await openai.beta.assistants.create({
-          name: "Quiz Generator",
+          name: `Quiz Generator - ${file.name}`,
           instructions: ASSISTANT_INSTRUCTIONS,
           model: "gpt-4-turbo-preview",
           tools: [{ type: "file_search" }]
@@ -74,70 +77,114 @@ export async function POST(req: NextRequest) {
         });
 
         return NextResponse.json({ 
-          message: 'File uploaded and assistant created successfully', 
+          success: true,
           fileId: file.name,
           vectorStoreId: vectorStore.id,
           assistantId: assistant.id
         });
       } catch (error) {
-        console.error('Error in file processing:', error);
+        console.error('File processing error:', error);
         throw error;
       }
     }
 
     if (!assistantId) {
-      return NextResponse.json({ error: 'Assistant ID is required' }, { status: 400 });
+      return NextResponse.json(
+        { error: 'アシスタントIDが必要です' }, 
+        { status: 400 }
+      );
     }
 
     const thread = await openai.beta.threads.create();
 
+    // プロンプトにもJSON形式での返答を強調
+    const userPrompt = `${prompt || "アップロードされた資料から重要なポイントを確認する問題を3つ作成してください"}
+
+Return ONLY a JSON object containing the questions. Do not include any other text.`;
+
     await openai.beta.threads.messages.create(thread.id, {
       role: "user",
-      content: prompt || "アップロードされた資料から重要なポイントを確認する問題を3つ作成してください"
+      content: userPrompt
     });
 
     const run = await openai.beta.threads.runs.create(thread.id, {
       assistant_id: assistantId,
-      instructions: "Remember to always provide your answer in valid JSON format with the questions array."
+      instructions: "IMPORTANT: Return ONLY a valid JSON object. Do not include any explanatory text or markdown. The entire response must be parseable by JSON.parse()",
+     
+      
     });
 
-    let questions;
-    while (true) {
-      const runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
+    const maxAttempts = 30;
+    let attempts = 0;
+
+    while (attempts < maxAttempts) {
+      const runStatus = await openai.beta.threads.runs.retrieve(
+        thread.id, 
+        run.id,
+      );
       
       if (runStatus.status === 'completed') {
         const messages = await openai.beta.threads.messages.list(thread.id);
         const lastMessage = messages.data[0].content[0];
-        console.log('Last message:', lastMessage);
         
         if ('text' in lastMessage) {
           try {
             const responseText = lastMessage.text.value.trim();
+            
+            // 余分なテキストを除去してJSONを抽出
             const jsonMatch = responseText.match(/\{[\s\S]*\}/);
             if (!jsonMatch) {
-              throw new Error('No valid JSON found in response');
+              throw new Error('JSONが見つかりません');
             }
-            questions = JSON.parse(jsonMatch[0]);
+
+            const cleanJson = jsonMatch[0].trim();
+            const questions = JSON.parse(cleanJson);
+            
+           // 基本的な構造の検証
+           if (!questions.questions || !Array.isArray(questions.questions)) {
+            console.log('Invalid structure:', questions);
+            throw new Error('questions配列が見つかりません');
+          }
+
+          // 各質問を正規化
+          const normalizedQuestions = questions.questions.map((q: any, index: number) => {
+            // 必須フィールドが無い場合はデフォルト値を設定
+            return {
+              id: q.id || `q${index + 1}`,
+              content: q.content || '問題文が設定されていません',
+              type: q.type || 'multiple_choice',
+              choices: q.type !== 'text' ? (q.choices || ['選択肢1', '選択肢2', '選択肢3', '選択肢4']) : undefined,
+              correctAnswer: q.correctAnswer || '正解が設定されていません',
+              explanation: q.explanation || '解説が設定されていません'
+            };
+          });
+
+
+            return NextResponse.json({
+              success: true,
+              questions: normalizedQuestions
+            });
           } catch (error) {
-            console.error('Failed to parse JSON response:', error);
-            throw new Error('Invalid response format from assistant');
+            console.error('Response parsing error:', error);
+            throw error;
           }
         }
         break;
       }
       
       if (runStatus.status === 'failed' || runStatus.status === 'cancelled') {
-        throw new Error(`Run failed with status: ${runStatus.status}`);
+        throw new Error(`実行が失敗しました: ${runStatus.status}`);
       }
       
       await new Promise(resolve => setTimeout(resolve, 1000));
+      attempts++;
     }
 
-    return NextResponse.json({ questions });
+    throw new Error('タイムアウトまたは無効な応答');
   } catch (error) {
     console.error('Error:', error);
     return NextResponse.json({ 
-      error: error instanceof Error ? error.message : 'Processing failed' 
+      error: error instanceof Error ? error.message : '処理に失敗しました' 
     }, { status: 500 });
   }
 }
