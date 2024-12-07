@@ -1,3 +1,17 @@
+# study-assistant
+作りたいもの
+- pdfや画像を投げたら、vectorサーチのDBに保存して、テスト問題を作成するwebアプリケーション
+
+
+
+## 環境構築
+- root配下に.envを作成する
+```.env
+OPENAI_API_KEY=ここにOpenAIのAPIKeyを入れる
+```
+
+
+
 ### vector Searchを使ってみる
 
 - app
@@ -10,8 +24,3 @@
   - type
     - 型をおく
 
-
-作りたいもの
-- pdfや画像を投げたら、vectorサーチのDBに保存して、テスト問題を作成するwebアプリケーション
-
-# study-assistant
